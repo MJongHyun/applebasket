@@ -1,0 +1,102 @@
+import org.apache.spark.sql.DataFrame
+
+val dti_hdr = spark.read.parquet("/user/db_parquet/market_db/DTI_HDR.parquet")
+val new_mstr = spark.read.parquet("/user/moonjonghyun/RE_DTI_COM_MSTR.parquet")
+
+//입력값 : 거래 데이터, 업종데이터 (사업자가 있는 데이터), 시점 (연도)
+
+def ent_function(hdr_data: DataFrame, indr_data: DataFrame, year: Int) = {
+    
+    // 거래데이터에서 해당되는 연도의 데이터만 추출
+    
+    val hdr_data_ = hdr_data.withColumn("YM", substring('WR_DT, 0, 4).cast("int"))
+    val target = hdr_data_.filter('YM===year)
+    
+    target.createOrReplaceTempView("df")
+    indr_data.createOrReplaceTempView("mstr")
+    
+    // JOIN을 통해 SUP의 업종 추출
+
+    val df2 = spark.sql("""select df.SUP_RGNO, df.SUP_NM, mstr.BIZ_TYPE_CD as SUP_INDR_CD, df.BYR_RGNO, df.BYR_NM, df.SUP_AMT from df left join mstr on df.SUP_RGNO = mstr.COM_RGNO """)
+    df2.createOrReplaceTempView("df2")
+
+    // JOIN을 통해 BYR의 업종 추출
+
+    val df3 = spark.sql("""select df2.SUP_RGNO, df2.SUP_NM, df2.SUP_INDR_CD, df2.BYR_RGNO, df2.BYR_NM, mstr.BIZ_TYPE_CD as BYR_INDR_CD, df2.SUP_AMT from df2 left join mstr on df2.BYR_RGNO = mstr.COM_RGNO """)
+    df3.createOrReplaceTempView("df3")
+
+    // 개인사업자 제거
+
+    val df4 = spark.sql("""select * from df3 where BYR_RGNO NOT IN ('-100000000000') """)
+    df4.createOrReplaceTempView("new_df")
+
+    // supplier, buyer agent 각각의 총 거래금액 산출
+
+    val sup_sum = spark.sql("""select SUP_RGNO, sum(SUP_AMT) as SUP_TOT from new_df group by 1""")
+    sup_sum.createOrReplaceTempView("sup_sum")
+
+    val byr_sum = spark.sql("""select BYR_RGNO, sum(SUP_AMT) as BYR_TOT from new_df group by 1""")
+    byr_sum.createOrReplaceTempView("byr_sum")
+
+    // 거래관계데이터에 각 agent의 총 거래금액 join
+
+    val df5 = spark.sql("""select new_df.SUP_RGNO, new_df.SUP_NM, new_df.SUP_INDR_CD, new_df.BYR_RGNO, new_df.BYR_NM, new_df.BYR_INDR_CD, new_df.SUP_AMT, sup_sum.SUP_TOT from new_df left join sup_sum on new_df.SUP_RGNO = sup_sum.SUP_RGNO """)
+    df5.createOrReplaceTempView("df5")
+
+    val df6 = spark.sql("""select df5.SUP_RGNO, df5.SUP_NM, df5.SUP_INDR_CD, df5.SUP_TOT, df5.BYR_RGNO, df5.BYR_NM, df5.BYR_INDR_CD, df5.SUP_AMT, byr_sum.BYR_TOT from df5 left join byr_sum on df5.BYR_RGNO = byr_sum.BYR_RGNO """)
+    df6.createOrReplaceTempView("df6")
+
+    // supplier agent 각각의 entropy 산출
+
+    val sup_cd = spark.sql("""select SUP_RGNO, SUP_INDR_CD, BYR_INDR_CD, count(*) as CN from df6 group by 1,2,3 """)
+    sup_cd.createOrReplaceTempView("sup_cd")
+
+    val sup_cd2 = spark.sql("""select SUP_RGNO as SUP_RGNO2, SUP_INDR_CD as SUP_INDR_CD2, sum(CN) as SM from sup_cd group by 1,2 """)
+    sup_cd2.createOrReplaceTempView("sup_cd2")
+
+    val sup_cd3 = spark.sql("""select sup_cd.SUP_RGNO, sup_cd.SUP_INDR_CD, sup_cd.BYR_INDR_CD, sup_cd.CN, sup_cd2.SM from sup_cd left join sup_cd2 on sup_cd.SUP_RGNO = sup_cd2.SUP_RGNO2 AND coalesce(sup_cd.SUP_INDR_CD, '') = coalesce(sup_cd2.SUP_INDR_CD2, '') """)
+    sup_cd3.createOrReplaceTempView("sup_cd3")
+
+    val sup_cd4 = spark.sql("""select *, CN/SM as P, LOG(2,CN/SM)*(-1)*(CN/SM) as ENT from sup_cd3 """)
+    sup_cd4.createOrReplaceTempView("sup_cd4")
+
+    val sup_cd5 = spark.sql("""select SUP_RGNO as SUP_RGNO2, SUP_INDR_CD as SUP_INDR_CD2, sum(ENT) as ENT_SUM from sup_cd4 group by 1,2 """)
+    sup_cd5.createOrReplaceTempView("sup_cd5")
+
+    val sup_cd6 = spark.sql("""select sup_cd4.SUP_RGNO as SUP_RGNO3, sup_cd4.SUP_INDR_CD as SUP_INDR_CD3, sup_cd4.BYR_INDR_CD as BYR_INDR_CD3, sup_cd4.P, sup_cd5.ENT_SUM from sup_cd4 left join sup_cd5 on sup_cd4.SUP_RGNO = sup_cd5.SUP_RGNO2 AND coalesce(sup_cd4.SUP_INDR_CD, '') = coalesce(sup_cd5.SUP_INDR_CD2, '') """)
+    sup_cd6.createOrReplaceTempView("sup_cd6")
+
+    // 거래데이터에 join
+
+    val df7 = spark.sql("""select df6.SUP_RGNO, df6.SUP_NM, df6.SUP_INDR_CD, df6.SUP_TOT, df6.BYR_RGNO, df6.BYR_NM, df6.BYR_INDR_CD, df6.SUP_AMT, df6.BYR_TOT, sup_cd6.P, sup_cd6.ENT_SUM as SUP_ENT_SUM from df6 left join sup_cd6 on df6.SUP_RGNO=sup_cd6.SUP_RGNO3 AND coalesce(df6.SUP_INDR_CD, '')=coalesce(sup_cd6.SUP_INDR_CD3, '') AND coalesce(df6.BYR_INDR_CD, '') = coalesce(sup_cd6.BYR_INDR_CD3, '')""")
+    df7.createOrReplaceTempView("df7")
+
+    // buyer agent 각각의 entropy 산출
+
+    val byr_cd = spark.sql("""select BYR_RGNO, BYR_INDR_CD, SUP_INDR_CD, count(*) as CN from df6 group by 1,2,3 """)
+    byr_cd.createOrReplaceTempView("byr_cd")
+
+    val byr_cd2 = spark.sql("""select BYR_RGNO as BYR_RGNO2, BYR_INDR_CD as BYR_INDR_CD2, sum(CN) as SM from byr_cd group by 1,2 """)
+    byr_cd2.createOrReplaceTempView("byr_cd2")
+
+    val byr_cd3 = spark.sql("""select byr_cd.BYR_RGNO, byr_cd.BYR_INDR_CD, byr_cd.SUP_INDR_CD, byr_cd.CN, byr_cd2.SM from byr_cd left join byr_cd2 on byr_cd.BYR_RGNO = byr_cd2.BYR_RGNO2 AND coalesce(byr_cd.BYR_INDR_CD, '') = coalesce(byr_cd2.BYR_INDR_CD2, '') """)
+    byr_cd3.createOrReplaceTempView("byr_cd3")
+
+    val byr_cd4 = spark.sql("""select *, CN/SM as P, LOG(2,CN/SM)*(-1)*(CN/SM) as ENT from byr_cd3 """)
+    byr_cd4.createOrReplaceTempView("byr_cd4")
+
+    val byr_cd5 = spark.sql("""select BYR_RGNO as BYR_RGNO2, BYR_INDR_CD as BYR_INDR_CD2, sum(ENT) as ENT_SUM from byr_cd4 group by 1,2 """)
+    byr_cd5.createOrReplaceTempView("byr_cd5")
+
+    val byr_cd6 = spark.sql("""select byr_cd4.BYR_RGNO as BYR_RGNO3, byr_cd4.BYR_INDR_CD as BYR_INDR_CD3, byr_cd4.SUP_INDR_CD as SUP_INDR_CD3, byr_cd4.P, byr_cd5.ENT_SUM from byr_cd4 left join byr_cd5 on byr_cd4.BYR_RGNO = byr_cd5.BYR_RGNO2 AND coalesce(byr_cd4.BYR_INDR_CD, '') = coalesce(byr_cd5.BYR_INDR_CD2, '') """)
+    byr_cd6.createOrReplaceTempView("byr_cd6")
+
+    // 거래데이터에 join
+
+    val df8 = spark.sql("""select df7.SUP_RGNO, df7.SUP_NM, df7.SUP_INDR_CD, df7.SUP_TOT, df7.BYR_RGNO, df7.BYR_NM, df7.BYR_INDR_CD, df7.SUP_AMT, df7.BYR_TOT, df7.P, df7.SUP_ENT_SUM, byr_cd6.ENT_SUM as BYR_ENT_SUM from df7 left join byr_cd6 on df7.BYR_RGNO=byr_cd6.BYR_RGNO3 AND coalesce(df7.BYR_INDR_CD, '')=coalesce(byr_cd6.BYR_INDR_CD3, '') AND coalesce(df7.SUP_INDR_CD, '') = coalesce(byr_cd6.SUP_INDR_CD3, '')""")
+    df8.createOrReplaceTempView("df8")
+
+    val df9 = df8.select('SUP_RGNO, 'SUP_NM, 'SUP_INDR_CD, 'SUP_TOT, 'BYR_RGNO, 'BYR_NM, 'BYR_INDR_CD, 'BYR_TOT, 'P, 'SUP_ENT_SUM, 'BYR_ENT_SUM).distinct()
+
+    df9
+}
